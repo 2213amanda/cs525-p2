@@ -1,4 +1,4 @@
-#define _POSIX_C_SOURCE 200112L
+#define _POSIX_C_SOURCE 200809L
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -8,30 +8,109 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <errno.h>
+#include <sys/time.h>
+#include <signal.h>
+#include <poll.h>
+
+#define TEST_PORT_SIZE 16
+#define TEST_TIMEOUT_MS 3000
+
+static int test_relay_fd = -1;
+static pid_t test_receiver_pid = -1;
+static struct sockaddr_in test_receiver_addr;
+static char test_output_path[128];
 
 static int relay_fd;
 static struct sockaddr_in relay_addr;
-static pid_t relay_pid;
+
+/* Test relay state for runSender */
+static pid_t relay_pid = -1;
+static char relay_port[16];
+
+
+/*
+ * Stop the child process and release test resources.
+ */
+static void testStopReceiver(void)
+{
+    if (test_receiver_pid > 0) {
+        int status;
+        pid_t result;
+
+        /*
+         * Give the receiver time to finish its FIN linger period.
+         * Kill it if a test failed before completing the transfer.
+         */
+        result = waitpid(test_receiver_pid, &status, WNOHANG);
+
+        if (result == 0) {
+            kill(test_receiver_pid, SIGTERM);
+            (void)waitpid(test_receiver_pid, &status, 0);
+        }
+
+        test_receiver_pid = -1;
+    }
+
+    if (test_relay_fd >= 0) {
+        close(test_relay_fd);
+        test_relay_fd = -1;
+    }
+
+    if (test_output_path[0] != '\0') {
+        unlink(test_output_path);
+        test_output_path[0] = '\0';
+    }
+}
 
 void setUp(void)
 {
     relay_fd = -1;
     relay_pid = -1;
     memset(&relay_addr, 0, sizeof(relay_addr));
+
+    relay_port[0] = '\0';
+
+    test_relay_fd = -1;
+    test_receiver_pid = -1;
+    test_output_path[0] = '\0';
+    memset(&test_receiver_addr, 0, sizeof(test_receiver_addr));
 }
 
 void tearDown(void)
 {
+    /* Close the relay socket if it is open. */
     if (relay_fd >= 0) {
         close(relay_fd);
         relay_fd = -1;
     }
 
+    /* Stop and reap the relay child process. */
     if (relay_pid > 0) {
         int status;
-        waitpid(relay_pid, &status, 0);
+
+        /* Ask the child to terminate. */
+        if (kill(relay_pid, SIGTERM) < 0 && errno != ESRCH) {
+            perror("kill");
+        }
+
+        /* Reap the child, retrying if interrupted. */
+        while (waitpid(relay_pid, &status, 0) < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            if (errno != ECHILD) {
+                perror("waitpid");
+            }
+
+            break;
+        }
+
         relay_pid = -1;
     }
+
+    testStopReceiver();
 }
 
 //packetChecksum
@@ -3289,6 +3368,625 @@ void test_registerSender_invalidSocket(void)
             0.1, 0.05, 0.0));
 }
 
+// runSender tests
+
+/*
+ * Create a temporary file containing the supplied data.
+ * Returns 0 on success and -1 on failure.
+ */
+static int createTempFile(const char *contents,
+                          char *path,
+                          size_t path_size)
+{
+    const char *template_path = "/tmp/runSender_test_XXXXXX";
+    int fd;
+
+    if (path == NULL || path_size < strlen(template_path) + 1) {
+        return -1;
+    }
+
+    strcpy(path, template_path);
+
+    fd = mkstemp(path);
+    if (fd < 0) {
+        return -1;
+    }
+
+    if (contents != NULL) {
+        size_t length = strlen(contents);
+        size_t written = 0;
+
+        while (written < length) {
+            ssize_t n = write(fd, contents + written,
+                              length - written);
+
+            if (n < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+
+                close(fd);
+                unlink(path);
+                return -1;
+            }
+
+            written += (size_t)n;
+        }
+    }
+
+    if (close(fd) != 0) {
+        unlink(path);
+        return -1;
+    }
+
+    return 0;
+}
+
+/*
+ * Start a local UDP relay that rejects sender registration.
+ *
+ * The relay replies "ERR test rejection" to each registration
+ * datagram. The listening socket is bound to an available local port.
+ *
+ * Returns 0 on success and -1 on failure.
+ */
+static int startRejectingRelay(void)
+{
+    int sockfd;
+    struct sockaddr_in address;
+    socklen_t address_len = sizeof(address);
+
+    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0) {
+        return -1;
+    }
+
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(0);
+
+    if (bind(sockfd, (struct sockaddr *)&address,
+             sizeof(address)) < 0) {
+        close(sockfd);
+        return -1;
+    }
+
+    if (getsockname(sockfd, (struct sockaddr *)&address,
+                    &address_len) < 0) {
+        close(sockfd);
+        return -1;
+    }
+
+    if (snprintf(relay_port, sizeof(relay_port), "%u",
+                 (unsigned int)ntohs(address.sin_port)) >=
+        (int)sizeof(relay_port)) {
+        close(sockfd);
+        return -1;
+    }
+
+    relay_pid = fork();
+
+    if (relay_pid < 0) {
+        close(sockfd);
+        return -1;
+    }
+
+    if (relay_pid == 0) {
+        /*
+         * Child process: handle registration requests.
+         * A timeout prevents the child from blocking indefinitely
+         * if the test exits before all retries are sent.
+         */
+        struct timeval timeout;
+        timeout.tv_sec = 1;
+        timeout.tv_usec = 0;
+
+        (void)setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO,
+                         &timeout, sizeof(timeout));
+
+        for (int i = 0; i < 5; i++) {
+            char request[256];
+            struct sockaddr_storage client;
+            socklen_t client_len = sizeof(client);
+
+            ssize_t received =
+                recvfrom(sockfd, request, sizeof(request), 0,
+                         (struct sockaddr *)&client, &client_len);
+
+            if (received < 0) {
+                if (errno == EINTR) {
+                    i--;
+                    continue;
+                }
+
+                break;
+            }
+
+            static const char response[] = "ERR test rejection";
+
+            (void)sendto(sockfd, response, sizeof(response) - 1,
+                         0, (struct sockaddr *)&client, client_len);
+        }
+
+        close(sockfd);
+        _exit(0);
+    }
+
+    /* Parent process no longer needs its copy of the socket. */
+    close(sockfd);
+    return 0;
+}
+
+/* ---------- Argument validation tests ---------- */
+
+void test_runSender_nullRelay_returnsFailure(void)
+{
+    TEST_ASSERT_NOT_EQUAL(
+        0,
+        runSender(NULL, "4250", "ta-2", "input.txt",
+                  8, 250, 0.0, 0.0, 0.0)
+    );
+}
+
+void test_runSender_nullFilename_returnsFailure(void)
+{
+    TEST_ASSERT_NOT_EQUAL(
+        0,
+        runSender("127.0.0.1", "4250", "ta-2", NULL,
+                  8, 250, 0.0, 0.0, 0.0)
+    );
+}
+
+void test_runSender_zeroWindow_returnsFailure(void)
+{
+    TEST_ASSERT_NOT_EQUAL(
+        0,
+        runSender("127.0.0.1", "4250", "ta-2", "input.txt",
+                  0, 250, 0.0, 0.0, 0.0)
+    );
+}
+
+void test_runSender_windowAboveMaximum_returnsFailure(void)
+{
+    TEST_ASSERT_NOT_EQUAL(
+        0,
+        runSender("127.0.0.1", "4250", "ta-2", "input.txt",
+                  MAX_WINDOW + 1, 250, 0.0, 0.0, 0.0)
+    );
+}
+
+void test_runSender_zeroTimeout_returnsFailure(void)
+{
+    TEST_ASSERT_NOT_EQUAL(
+        0,
+        runSender("127.0.0.1", "4250", "ta-2", "input.txt",
+                  8, 0, 0.0, 0.0, 0.0)
+    );
+}
+
+/* ---------- File handling tests ---------- */
+
+void test_runSender_missingFile_returnsFailure(void)
+{
+    TEST_ASSERT_NOT_EQUAL(
+        0,
+        runSender("127.0.0.1", "4250", "ta-2",
+                  "/tmp/runSender_file_that_does_not_exist",
+                  8, 250, 0.0, 0.0, 0.0)
+    );
+}
+
+/* ---------- Address resolution tests ---------- */
+
+void test_runSender_invalidPort_returnsFailure(void)
+{
+    char filename[64];
+
+    TEST_ASSERT_EQUAL_INT(
+        0, createTempFile("test data", filename, sizeof(filename))
+    );
+
+    /*
+     * The service name is deliberately invalid, so address
+     * resolution should fail before relay registration.
+     */
+    TEST_ASSERT_NOT_EQUAL(
+        0,
+        runSender("127.0.0.1", "invalid_port", "ta-2",
+                  filename, 8, 250, 0.0, 0.0, 0.0)
+    );
+
+    unlink(filename);
+}
+
+/* ---------- Relay registration tests ---------- */
+
+void test_runSender_relayRejectsRegistration_returnsFailure(void)
+{
+    char filename[64];
+
+    TEST_ASSERT_EQUAL_INT(
+        0, createTempFile("test data", filename, sizeof(filename))
+    );
+
+    TEST_ASSERT_EQUAL_INT(0, startRejectingRelay());
+
+    TEST_ASSERT_NOT_EQUAL(
+        0,
+        runSender("127.0.0.1", relay_port, "ta-2",
+                  filename, 8, 250, 0.0, 0.0, 0.0)
+    );
+
+    unlink(filename);
+}
+
+
+// test runReceiver
+
+/*
+ * Wait for a datagram on the mock relay socket.
+ * Returns the received byte count, or -1 on failure/timeout.
+ */
+static ssize_t testRecvDatagram(uint8_t *buffer, size_t capacity,
+                                struct sockaddr_in *source,
+                                int timeout_ms)
+{
+    struct pollfd pfd;
+    socklen_t source_len = sizeof(*source);
+
+    pfd.fd = test_relay_fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+
+    int result = poll(&pfd, 1, timeout_ms);
+
+    if (result <= 0 || !(pfd.revents & POLLIN)) {
+        return -1;
+    }
+
+    return recvfrom(test_relay_fd, buffer, capacity, 0,
+                    (struct sockaddr *)source, &source_len);
+}
+
+/*
+ * Send an encoded packet from the mock relay to the receiver.
+ */
+static int testSendPacket(const Packet *packet)
+{
+    uint8_t buffer[MAX_PACKET_SIZE];
+    size_t packet_size;
+
+    if (encodePacket(packet, buffer, sizeof(buffer),
+                     &packet_size) != 0) {
+        return -1;
+    }
+
+    ssize_t sent = sendto(
+        test_relay_fd, buffer, packet_size, 0,
+        (struct sockaddr *)&test_receiver_addr,
+        sizeof(test_receiver_addr));
+
+    return sent == (ssize_t)packet_size ? 0 : -1;
+}
+
+/*
+ * Receive and decode an ACK from the receiver.
+ */
+static int testReceiveAck(uint32_t expected_seq)
+{
+    uint8_t buffer[MAX_PACKET_SIZE];
+    struct sockaddr_in source;
+    Packet ack;
+
+    ssize_t received = testRecvDatagram(
+        buffer, sizeof(buffer), &source, TEST_TIMEOUT_MS);
+
+    if (received < 0) {
+        return -1;
+    }
+
+    if (decodePacket(buffer, (size_t)received, &ack) != 0) {
+        return -1;
+    }
+
+    if (ack.type != PACKET_ACK ||
+        ack.seq != expected_seq ||
+        ack.length != 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+/*
+ * Start a mock relay and a child process running runReceiver().
+ * The parent process completes the receiver's registration.
+ */
+static int testStartReceiver(void)
+{
+    struct sockaddr_in relay_addr;
+    socklen_t relay_len = sizeof(relay_addr);
+    char port[TEST_PORT_SIZE];
+    uint8_t buffer[MAX_PACKET_SIZE];
+    struct sockaddr_in source;
+    ssize_t received;
+
+    test_relay_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (test_relay_fd < 0) {
+        return -1;
+    }
+
+    memset(&relay_addr, 0, sizeof(relay_addr));
+    relay_addr.sin_family = AF_INET;
+    relay_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    relay_addr.sin_port = 0;
+
+    if (bind(test_relay_fd, (struct sockaddr *)&relay_addr,
+             sizeof(relay_addr)) < 0) {
+        return -1;
+    }
+
+    if (getsockname(test_relay_fd,
+                    (struct sockaddr *)&relay_addr,
+                    &relay_len) < 0) {
+        return -1;
+    }
+
+    if (snprintf(port, sizeof(port), "%u",
+                 (unsigned int)ntohs(relay_addr.sin_port))
+        >= (int)sizeof(port)) {
+        return -1;
+    }
+
+    snprintf(test_output_path, sizeof(test_output_path),
+             "/tmp/runReceiver-test-%ld.bin", (long)getpid());
+
+    test_receiver_pid = fork();
+
+    if (test_receiver_pid < 0) {
+        return -1;
+    }
+
+    if (test_receiver_pid == 0) {
+        /*
+         * The receiver opens its own socket.
+         * The inherited relay descriptor is unused by the child.
+         */
+        int result = runReceiver(
+            "127.0.0.1", port, "ta-2", test_output_path);
+
+        _exit(result == 0 ? 0 : 1);
+    }
+
+    /*
+     * Receive the receiver's HELLO registration.
+     */
+    received = testRecvDatagram(
+        buffer, sizeof(buffer), &source, TEST_TIMEOUT_MS);
+
+    if (received < 0) {
+        return -1;
+    }
+
+    buffer[(size_t)received < sizeof(buffer)
+           ? (size_t)received : sizeof(buffer) - 1] = '\0';
+
+    if (strcmp((char *)buffer, "HELLO ta-2 recv") != 0) {
+        return -1;
+    }
+
+    test_receiver_addr = source;
+
+    /*
+     * Complete registration.
+     */
+    if (sendto(test_relay_fd, "OK", 2, 0,
+               (struct sockaddr *)&test_receiver_addr,
+               sizeof(test_receiver_addr)) != 2) {
+        return -1;
+    }
+
+    return 0;
+}
+
+
+/*
+ * Send FIN and check the final cumulative ACK.
+ */
+static int testSendFinAndFinish(uint32_t seq)
+{
+    Packet fin;
+
+    if (makeFinPacket(&fin, seq) != 0) {
+        return -1;
+    }
+
+    if (testSendPacket(&fin) != 0) {
+        return -1;
+    }
+
+    /*
+     * FIN advances the receiver's expected sequence number,
+     * so the final ACK is seq + 1.
+     */
+    return testReceiveAck(seq + 1);
+}
+
+/*
+ * A valid DATA packet followed by FIN should produce cumulative
+ * ACKs and write the original payload to the output file.
+ */
+void test_runReceiver_validDataAndFin(void)
+{
+    const uint8_t content[] = {
+        'H', 'e', 'l', 'l', 'o', '\0', 'U', 'D', 'P'
+    };
+
+    Packet data;
+    FILE *file;
+    uint8_t actual[sizeof(content)];
+    size_t count;
+
+    TEST_ASSERT_EQUAL_INT(0, testStartReceiver());
+
+    TEST_ASSERT_EQUAL_INT(
+        0, makeDataPacket(&data, 0, content, sizeof(content)));
+
+    TEST_ASSERT_EQUAL_INT(0, testSendPacket(&data));
+    TEST_ASSERT_EQUAL_INT(0, testReceiveAck(1));
+
+    TEST_ASSERT_EQUAL_INT(0, testSendFinAndFinish(1));
+
+    /*
+     * The child exits after its FIN linger period.
+     */
+    int status;
+    TEST_ASSERT_EQUAL_INT(
+        test_receiver_pid,
+        waitpid(test_receiver_pid, &status, 0));
+
+    TEST_ASSERT_TRUE(WIFEXITED(status));
+    TEST_ASSERT_EQUAL_INT(0, WEXITSTATUS(status));
+    test_receiver_pid = -1;
+
+    file = fopen(test_output_path, "rb");
+    TEST_ASSERT_NOT_NULL(file);
+
+    count = fread(actual, 1, sizeof(actual), file);
+
+    TEST_ASSERT_EQUAL_size_t(sizeof(content), count);
+    TEST_ASSERT_EQUAL_MEMORY(content, actual, sizeof(content));
+    TEST_ASSERT_EQUAL_INT(0, fclose(file));
+}
+
+/*
+ * An empty file consists of a FIN packet with sequence number 0.
+ * The receiver should create an empty output file and exit cleanly.
+ */
+void test_runReceiver_emptyFile(void)
+{
+    FILE *file;
+    int status;
+
+    TEST_ASSERT_EQUAL_INT(0, testStartReceiver());
+    TEST_ASSERT_EQUAL_INT(0, testSendFinAndFinish(0));
+
+    TEST_ASSERT_EQUAL_INT(
+        test_receiver_pid,
+        waitpid(test_receiver_pid, &status, 0));
+
+    TEST_ASSERT_TRUE(WIFEXITED(status));
+    TEST_ASSERT_EQUAL_INT(0, WEXITSTATUS(status));
+    test_receiver_pid = -1;
+
+    file = fopen(test_output_path, "rb");
+    TEST_ASSERT_NOT_NULL(file);
+
+    TEST_ASSERT_EQUAL_INT(EOF, fgetc(file));
+    TEST_ASSERT_EQUAL_INT(0, fclose(file));
+}
+
+/*
+ * A corrupted datagram must be silently discarded.
+ * The following valid DATA packet should still be accepted.
+ */
+void test_runReceiver_discardsCorruptedPacket(void)
+{
+    Packet data;
+    uint8_t buffer[MAX_PACKET_SIZE];
+    size_t packet_size;
+    struct sockaddr_in source;
+
+    const uint8_t content[] = { 'A', 'B', 'C' };
+
+    TEST_ASSERT_EQUAL_INT(0, testStartReceiver());
+
+    TEST_ASSERT_EQUAL_INT(
+        0, makeDataPacket(&data, 0, content, sizeof(content)));
+
+    TEST_ASSERT_EQUAL_INT(
+        0, encodePacket(&data, buffer, sizeof(buffer), &packet_size));
+
+    /* Damage the packet without updating its checksum. */
+    buffer[HEADER_SIZE] ^= 0x01;
+
+    TEST_ASSERT_EQUAL_INT(
+        (int)packet_size,
+        (int)sendto(test_relay_fd, buffer, packet_size, 0,
+                    (struct sockaddr *)&test_receiver_addr,
+                    sizeof(test_receiver_addr)));
+
+    /*
+     * A corrupted packet must not produce an ACK.
+     */
+    uint8_t ack_buffer[MAX_PACKET_SIZE];
+
+    TEST_ASSERT_TRUE(
+        testRecvDatagram(ack_buffer, sizeof(ack_buffer),
+                         &source, 200) < 0);
+
+    /* Send the intact packet and verify it is acknowledged. */
+    TEST_ASSERT_EQUAL_INT(0, testSendPacket(&data));
+    TEST_ASSERT_EQUAL_INT(0, testReceiveAck(1));
+
+    TEST_ASSERT_EQUAL_INT(0, testSendFinAndFinish(1));
+}
+
+/*
+ * Out-of-order DATA must not advance the receiver or be written.
+ * The receiver should ACK the next expected sequence number.
+ */
+void test_runReceiver_outOfOrderData(void)
+{
+    const uint8_t first[] = { 'A' };
+    const uint8_t second[] = { 'B' };
+    Packet data;
+
+    TEST_ASSERT_EQUAL_INT(0, testStartReceiver());
+
+    /* Sequence 1 arrives before sequence 0. */
+    TEST_ASSERT_EQUAL_INT(
+        0, makeDataPacket(&data, 1, second, sizeof(second)));
+    TEST_ASSERT_EQUAL_INT(0, testSendPacket(&data));
+    TEST_ASSERT_EQUAL_INT(0, testReceiveAck(0));
+
+    /* Sequence 0 is accepted. */
+    TEST_ASSERT_EQUAL_INT(
+        0, makeDataPacket(&data, 0, first, sizeof(first)));
+    TEST_ASSERT_EQUAL_INT(0, testSendPacket(&data));
+    TEST_ASSERT_EQUAL_INT(0, testReceiveAck(1));
+
+    /*
+     * Sequence 1 can now be accepted.
+     */
+    TEST_ASSERT_EQUAL_INT(
+        0, makeDataPacket(&data, 1, second, sizeof(second)));
+    TEST_ASSERT_EQUAL_INT(0, testSendPacket(&data));
+    TEST_ASSERT_EQUAL_INT(0, testReceiveAck(2));
+
+    TEST_ASSERT_EQUAL_INT(0, testSendFinAndFinish(2));
+
+    int status;
+    TEST_ASSERT_EQUAL_INT(
+        test_receiver_pid,
+        waitpid(test_receiver_pid, &status, 0));
+
+    TEST_ASSERT_TRUE(WIFEXITED(status));
+    TEST_ASSERT_EQUAL_INT(0, WEXITSTATUS(status));
+    test_receiver_pid = -1;
+
+    FILE *file = fopen(test_output_path, "rb");
+    TEST_ASSERT_NOT_NULL(file);
+
+    uint8_t actual[2];
+    TEST_ASSERT_EQUAL_size_t(2, fread(actual, 1, sizeof(actual), file));
+    TEST_ASSERT_EQUAL_UINT8('A', actual[0]);
+    TEST_ASSERT_EQUAL_UINT8('B', actual[1]);
+    TEST_ASSERT_EQUAL_INT(EOF, fgetc(file));
+    TEST_ASSERT_EQUAL_INT(0, fclose(file));
+}
+
 int main(void) {
   UNITY_BEGIN();
   RUN_TEST(test_packetChecksum_empty);
@@ -3509,6 +4207,20 @@ int main(void) {
     RUN_TEST(test_registerSender_corruptTooHigh);
     RUN_TEST(test_registerSender_dupTooHigh);
     RUN_TEST(test_registerSender_invalidSocket);
+
+    RUN_TEST(test_runSender_nullRelay_returnsFailure);
+    RUN_TEST(test_runSender_nullFilename_returnsFailure);
+    RUN_TEST(test_runSender_zeroWindow_returnsFailure);
+    RUN_TEST(test_runSender_windowAboveMaximum_returnsFailure);
+    RUN_TEST(test_runSender_zeroTimeout_returnsFailure);
+    RUN_TEST(test_runSender_missingFile_returnsFailure);
+    RUN_TEST(test_runSender_invalidPort_returnsFailure);    
+    RUN_TEST(test_runSender_relayRejectsRegistration_returnsFailure);
+    
+    RUN_TEST(test_runReceiver_validDataAndFin);
+    RUN_TEST(test_runReceiver_emptyFile);
+    RUN_TEST(test_runReceiver_discardsCorruptedPacket);
+    RUN_TEST(test_runReceiver_outOfOrderData);  
 
   return UNITY_END();
 }

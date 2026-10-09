@@ -1,6 +1,6 @@
 #include "lab.h"
 
-#define _POSIX_C_SOURCE 200112L
+#define _POSIX_C_SOURCE 200809L
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <sys/time.h>
+#include <limits.h>
 
 
 uint16_t packetChecksum(const uint8_t *data, size_t length){
@@ -1064,12 +1065,773 @@ int registerSender(int sockfd, const struct sockaddr *relay, socklen_t relay_len
 
 int runSender(const char *relay, const char *port, const char *session, const char *filename, uint32_t window, uint32_t timeout_ms, double loss, double corrupt, double dup)
 {
-    return 0;
+    FILE *file = NULL;
+    struct addrinfo *addresses = NULL;
+    struct addrinfo *addr = NULL;
+    struct sockaddr_storage relay_storage;
+    struct sockaddr *relay_addr = (struct sockaddr *)&relay_storage;
+    socklen_t relay_len = 0;
+    int sockfd = -1;
+    int result = 1;
+
+    SenderState sender;
+    uint8_t buffer[MAX_PACKET_SIZE];
+    uint8_t file_buffer[MAX_PAYLOAD];
+
+    if (relay == NULL || port == NULL || session == NULL ||
+        filename == NULL) {
+        fprintf(stderr, "runSender: invalid argument\n");
+        return 1;
+    }
+
+    if (window < 1 || window > MAX_WINDOW || timeout_ms == 0) {
+        fprintf(stderr, "runSender: invalid window or timeout\n");
+        return 1;
+    }
+
+    /* Open the file to transfer. */
+    file = fopen(filename, "rb");
+    if (file == NULL) {
+        perror("fopen");
+        goto cleanup;
+    }
+
+    /* Resolve the relay address. */
+    if (resolveAddr(relay, port, &addresses) != 0) {
+        fprintf(stderr, "runSender: failed to resolve relay\n");
+        goto cleanup;
+    }
+
+    /* Find an address for which a socket can be created. */
+    for (addr = addresses; addr != NULL; addr = addr->ai_next) {
+        sockfd = createSocket(addr);
+
+        if (sockfd >= 0) {
+            break;
+        }
+    }
+
+    if (sockfd < 0 || addr == NULL) {
+        fprintf(stderr, "runSender: failed to create socket\n");
+        goto cleanup;
+    }
+
+    if (addr->ai_addrlen > sizeof(relay_storage)) {
+        fprintf(stderr, "runSender: relay address is too large\n");
+        goto cleanup;
+    }
+
+    memset(&relay_storage, 0, sizeof(relay_storage));
+    memcpy(&relay_storage, addr->ai_addr, addr->ai_addrlen);
+    relay_len = (socklen_t)addr->ai_addrlen;
+
+    /* Initialize the Go-Back-N sender state. */
+    if (senderInit(&sender, window, timeout_ms) != 0) {
+        fprintf(stderr, "runSender: failed to initialize sender\n");
+        goto cleanup;
+    }
+
+    /*
+     * Register this sender with the relay.
+     * The same UDP socket is used for registration and data transfer.
+     */
+    if (registerSender(sockfd, relay_addr, relay_len,
+                       session, loss, corrupt, dup) != 0) {
+        fprintf(stderr, "runSender: relay registration failed\n");
+        goto cleanup;
+    }
+
+    int input_done = 0;
+
+    /*
+     * Main Go-Back-N sending loop.
+     */
+    while (!senderFinished(&sender)) {
+        uint64_t now_ms;
+        uint64_t remaining_ms = 0;
+        int timer_status;
+
+        /*
+         * Fill the sending window while there is file data remaining
+         * and the window has available space.
+         */
+        while (!input_done &&
+               sender.nextseqnum - sender.base < sender.window) {
+            size_t bytes_read;
+            Packet packet;
+            size_t encoded_size = 0;
+
+            bytes_read = fread(file_buffer, 1, MAX_PAYLOAD, file);
+
+            if (bytes_read == 0) {
+                if (ferror(file)) {
+                    perror("fread");
+                    goto cleanup;
+                }
+
+                input_done = 1;
+                break;
+            }
+
+            /*
+             * Construct a DATA packet and update sender state.
+             * senderSendData is responsible for assigning the sequence
+             * number and recording the packet for retransmission.
+             */
+            now_ms = getTimeMs();
+
+            if (senderSendData(&sender, file_buffer,
+                               (uint16_t)bytes_read,
+                               now_ms, &packet) != 0) {
+                fprintf(stderr,
+                        "runSender: failed to create DATA packet\n");
+                goto cleanup;
+            }
+
+            /* Encode the packet into its wire representation. */
+            if (encodePacket(&packet, buffer, sizeof(buffer),
+                             &encoded_size) != 0) {
+                fprintf(stderr,
+                        "runSender: failed to encode DATA packet\n");
+                goto cleanup;
+            }
+
+            /* Send the encoded datagram to the relay. */
+            ssize_t sent = sendto(sockfd, buffer, encoded_size, 0,
+                                  relay_addr, relay_len);
+
+            if (sent < 0 || (size_t)sent != encoded_size) {
+                perror("sendto DATA");
+                goto cleanup;
+            }
+        }
+
+        /*
+         * Send FIN only after the entire file has been read and every
+         * DATA packet has been acknowledged.
+         */
+        if (input_done &&
+            sender.base == sender.nextseqnum &&
+            !sender.fin_sent) {
+            Packet fin_packet;
+            size_t encoded_size = 0;
+
+            now_ms = getTimeMs();
+
+            if (senderSendFin(&sender, now_ms, &fin_packet) != 0) {
+                fprintf(stderr,
+                        "runSender: failed to create FIN packet\n");
+                goto cleanup;
+            }
+
+            if (encodePacket(&fin_packet, buffer, sizeof(buffer),
+                             &encoded_size) != 0) {
+                fprintf(stderr,
+                        "runSender: failed to encode FIN packet\n");
+                goto cleanup;
+            }
+
+            ssize_t sent = sendto(sockfd, buffer, encoded_size, 0,
+                                  relay_addr, relay_len);
+
+            if (sent < 0 || (size_t)sent != encoded_size) {
+                perror("sendto FIN");
+                goto cleanup;
+            }
+        }
+
+        /*
+         * Check whether the current timer has expired.
+         *
+         * Assumes senderTimerDue() returns:
+         *   > 0 when the timer is due,
+         *     0 when it is not due,
+         *   < 0 on error.
+         */
+        now_ms = getTimeMs();
+        timer_status = senderTimerDue(&sender, now_ms, &remaining_ms);
+
+        if (timer_status < 0) {
+            fprintf(stderr, "runSender: timer check failed\n");
+            goto cleanup;
+        }
+
+        if (timer_status > 0) {
+            /*
+             * DATA timeout: retransmit all outstanding packets,
+             * as required by Go-Back-N.
+             */
+            if (sender.base < sender.nextseqnum) {
+                Packet retransmissions[MAX_WINDOW];
+                size_t retransmission_count = 0;
+
+                if (senderHandleTimeout(&sender, now_ms,
+                                        retransmissions,
+                                        &retransmission_count) != 0) {
+                    fprintf(stderr,
+                            "runSender: DATA timeout handling failed\n");
+                    goto cleanup;
+                }
+
+                for (size_t i = 0;
+                     i < retransmission_count;
+                     i++) {
+                    size_t encoded_size = 0;
+
+                    if (encodePacket(&retransmissions[i], buffer,
+                                     sizeof(buffer),
+                                     &encoded_size) != 0) {
+                        fprintf(stderr,
+                                "runSender: failed to encode "
+                                "retransmission\n");
+                        goto cleanup;
+                    }
+
+                    ssize_t sent = sendto(sockfd, buffer, encoded_size,
+                                          0, relay_addr, relay_len);
+
+                    if (sent < 0 ||
+                        (size_t)sent != encoded_size) {
+                        perror("sendto retransmission");
+                        goto cleanup;
+                    }
+                }
+            }
+            /*
+             * FIN timeout: retransmit FIN until its ACK arrives.
+             */
+            else if (sender.fin_sent && !sender.fin_acked) {
+                size_t encoded_size = 0;
+
+                if (encodePacket(&sender.fin, buffer, sizeof(buffer),
+                                 &encoded_size) != 0) {
+                    fprintf(stderr,
+                            "runSender: failed to encode FIN "
+                            "retransmission\n");
+                    goto cleanup;
+                }
+
+                ssize_t sent = sendto(sockfd, buffer, encoded_size,
+                                      0, relay_addr, relay_len);
+
+                if (sent < 0 || (size_t)sent != encoded_size) {
+                    perror("sendto FIN retransmission");
+                    goto cleanup;
+                }
+
+                /*
+                 * Restart the FIN timer. This assumes the timer fields
+                 * are maintained directly in SenderState.
+                 */
+                sender.timer_start = getTimeMs();
+                sender.timer_running = 1;
+            }
+
+            continue;
+        }
+
+        /*
+         * Wait for an incoming datagram. If a timer is running,
+         * wait no longer than its remaining duration.
+         */
+        struct pollfd pfd;
+        pfd.fd = sockfd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+
+        int poll_timeout = -1;
+
+        if (sender.timer_running) {
+            if (remaining_ms > (uint64_t)INT_MAX) {
+                poll_timeout = INT_MAX;
+            } else {
+                poll_timeout = (int)remaining_ms;
+            }
+        }
+
+        int poll_result = poll(&pfd, 1, poll_timeout);
+
+        if (poll_result < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            perror("poll");
+            goto cleanup;
+        }
+
+        if (poll_result == 0) {
+            /* Timer expired; the next iteration handles retransmission. */
+            continue;
+        }
+
+        if ((pfd.revents & POLLIN) == 0) {
+            continue;
+        }
+
+        /*
+         * Receive an ACK from the relay.
+         */
+        uint8_t received_buffer[MAX_PACKET_SIZE];
+        struct sockaddr_storage source_storage;
+        struct sockaddr *source_addr =
+            (struct sockaddr *)&source_storage;
+        socklen_t source_len = sizeof(source_storage);
+
+        ssize_t received = recvfrom(sockfd, received_buffer,
+                                    sizeof(received_buffer), 0,
+                                    source_addr, &source_len);
+
+        if (received < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            perror("recvfrom");
+            goto cleanup;
+        }
+
+        /*
+         * Ignore datagrams that did not come from the configured relay.
+         * Compare address family, IP address, and UDP port.
+         */
+        int from_relay = 0;
+
+        if (source_addr->sa_family == relay_addr->sa_family) {
+            if (relay_addr->sa_family == AF_INET &&
+                source_len >= sizeof(struct sockaddr_in) &&
+                relay_len >= sizeof(struct sockaddr_in)) {
+                const struct sockaddr_in *source_ipv4 =
+                    (const struct sockaddr_in *)source_addr;
+                const struct sockaddr_in *relay_ipv4 =
+                    (const struct sockaddr_in *)relay_addr;
+
+                from_relay =
+                    source_ipv4->sin_port == relay_ipv4->sin_port &&
+                    source_ipv4->sin_addr.s_addr ==
+                        relay_ipv4->sin_addr.s_addr;
+            } else if (relay_addr->sa_family == AF_INET6 &&
+                       source_len >= sizeof(struct sockaddr_in6) &&
+                       relay_len >= sizeof(struct sockaddr_in6)) {
+                const struct sockaddr_in6 *source_ipv6 =
+                    (const struct sockaddr_in6 *)source_addr;
+                const struct sockaddr_in6 *relay_ipv6 =
+                    (const struct sockaddr_in6 *)relay_addr;
+
+                from_relay =
+                    source_ipv6->sin6_port == relay_ipv6->sin6_port &&
+                    memcmp(&source_ipv6->sin6_addr,
+                           &relay_ipv6->sin6_addr,
+                           sizeof(struct in6_addr)) == 0 &&
+                    source_ipv6->sin6_scope_id ==
+                        relay_ipv6->sin6_scope_id;
+            }
+        }
+
+        if (!from_relay) {
+            continue;
+        }
+
+        /*
+         * Decode the packet. Invalid packets are discarded.
+         */
+        Packet received_packet;
+
+        if (decodePacket(received_buffer, (size_t)received,
+                         &received_packet) != 0) {
+            continue;
+        }
+
+        if (received_packet.type != PACKET_ACK) {
+            continue;
+        }
+
+        now_ms = getTimeMs();
+
+        /*
+         * Once FIN has been sent, process ACKs as FIN acknowledgements.
+         * Otherwise process them as cumulative DATA acknowledgements.
+         */
+        if (sender.fin_sent && !sender.fin_acked) {
+            if (senderHandleFinAck(&sender, received_packet.seq,
+                                   now_ms) != 0) {
+                /*
+                 * A duplicate or unrelated ACK may not acknowledge FIN.
+                 * Ignore it rather than terminating the transfer.
+                 */
+                continue;
+            }
+        } else {
+            if (senderHandleAck(&sender, received_packet.seq,
+                                now_ms) != 0) {
+                /*
+                 * Invalid, duplicate, or out-of-range ACKs should not
+                 * cause the sender to terminate.
+                 */
+                continue;
+            }
+        }
+    }
+
+    /* The sender has received the final acknowledgement. */
+    result = 0;
+
+cleanup:
+    if (sockfd >= 0) {
+        close(sockfd);
+    }
+
+    if (addresses != NULL) {
+        freeaddrinfo(addresses);
+    }
+
+    if (file != NULL) {
+        fclose(file);
+    }
+
+    return result;
 }
 
 int runReceiver(const char *relay, const char *port, const char *session, const char *filename)
 {
-    return 0;
+    struct addrinfo hints;
+    struct addrinfo *results = NULL;
+    struct addrinfo *addr;
+    struct sockaddr_storage peer_addr;
+    socklen_t peer_len;
+
+    FILE *output = NULL;
+    int sockfd = -1;
+    int status = 1;
+    int registered = 0;
+
+    ReceiverState receiver;
+
+    uint8_t buffer[MAX_PACKET_SIZE];
+    uint8_t encoded[MAX_PACKET_SIZE];
+
+    size_t encoded_size;
+    ssize_t received;
+    ssize_t sent;
+
+    uint64_t now_ms;
+    uint64_t linger_start = 0;
+    const uint64_t linger_ms = 2000;
+
+    if (relay == NULL || port == NULL ||
+        session == NULL || filename == NULL) {
+        return 1;
+    }
+
+    /* Open the destination file for binary output. */
+    output = fopen(filename, "wb");
+    if (output == NULL) {
+        perror("fopen");
+        goto cleanup;
+    }
+
+    /* Resolve the relay address. */
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_protocol = IPPROTO_UDP;
+
+    if (resolveAddr(relay, port, &results) != 0) {
+        fprintf(stderr, "Could not resolve relay address\n");
+        goto cleanup;
+    }
+
+    /*
+     * Create one UDP socket and register with the relay.
+     * Keep this socket for the entire transfer.
+     */
+    for (addr = results; addr != NULL; addr = addr->ai_next) {
+        sockfd = createSocket(addr);
+        if (sockfd < 0) {
+            continue;
+        }
+
+        if (registerReceiver(sockfd, addr->ai_addr,
+                             (socklen_t)addr->ai_addrlen,
+                             session) == 0) {
+            registered = 1;
+            break;
+        }
+
+        close(sockfd);
+        sockfd = -1;
+    }
+
+    if (!registered) {
+        fprintf(stderr, "Receiver registration failed\n");
+        goto cleanup;
+    }
+
+    /* Initialize the receiver state machine. */
+    if (receiverInit(&receiver) != 0) {
+        fprintf(stderr, "Could not initialize receiver\n");
+        goto cleanup;
+    }
+
+    /*
+     * Receive DATA and FIN packets until the transfer completes.
+     * Invalid datagrams are silently discarded.
+     */
+    while (!receiver.finished) {
+        struct pollfd pfd;
+        Packet packet;
+        Packet ack;
+        int poll_result;
+        uint32_t previous_expected;
+        int accepted_data;
+
+        pfd.fd = sockfd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+
+        poll_result = poll(&pfd, 1, 1000);
+
+        if (poll_result < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            perror("poll");
+            goto cleanup;
+        }
+
+        if (poll_result == 0) {
+            now_ms = getTimeMs();
+
+            if (receiverTimerExpired(&receiver, now_ms)) {
+                fprintf(stderr, "Receiver timed out\n");
+                goto cleanup;
+            }
+
+            continue;
+        }
+
+        if (!(pfd.revents & POLLIN)) {
+            if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                fprintf(stderr, "UDP socket error\n");
+                goto cleanup;
+            }
+
+            continue;
+        }
+
+        peer_len = sizeof(peer_addr);
+
+        received = recvfrom(sockfd, buffer, sizeof(buffer), 0,
+                            (struct sockaddr *)&peer_addr,
+                            &peer_len);
+
+        if (received < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            perror("recvfrom");
+            goto cleanup;
+        }
+
+        /*
+         * Validate the actual datagram length, header fields,
+         * payload length, packet type, and checksum before
+         * processing or copying any payload.
+         */
+        if (decodePacket(buffer, (size_t)received, &packet) != 0) {
+            continue;
+        }
+
+        now_ms = getTimeMs();
+
+        /*
+         * Save the expected sequence number before processing
+         * DATA. Only the packet that was expected beforehand
+         * may be written to the output file.
+         */
+        previous_expected = receiver.expectedseqnum;
+        accepted_data = 0;
+
+        if (packet.type == PACKET_DATA) {
+            if (receiver.finished) {
+                continue;
+            }
+
+            accepted_data = (packet.seq == previous_expected);
+
+            if (receiverHandleData(&receiver, &packet,
+                                   now_ms, &ack) != 0) {
+                fprintf(stderr, "Could not process DATA packet\n");
+                goto cleanup;
+            }
+
+            if (accepted_data && packet.length > 0) {
+                if (fwrite(packet.payload, 1, packet.length,
+                           output) != packet.length) {
+                    perror("fwrite");
+                    goto cleanup;
+                }
+            }
+        } else if (packet.type == PACKET_FIN) {
+            /*
+             * The state-machine function determines whether FIN
+             * is expected and creates the appropriate ACK.
+             */
+            if (receiverHandleFin(&receiver, &packet,
+                                 now_ms, &ack) != 0) {
+                fprintf(stderr, "Could not process FIN packet\n");
+                goto cleanup;
+            }
+
+            if (receiver.finished && linger_start == 0) {
+                linger_start = getTimeMs();
+
+                if (fflush(output) != 0) {
+                    perror("fflush");
+                    goto cleanup;
+                }
+            }
+        } else {
+            /*
+             * ACK packets are not expected by the receiver.
+             */
+            continue;
+        }
+
+        /*
+         * Encode and send the cumulative ACK through the relay.
+         * The ACK sequence number comes from the state machine.
+         */
+        if (encodePacket(&ack, encoded, sizeof(encoded),
+                         &encoded_size) != 0) {
+            fprintf(stderr, "Could not encode ACK packet\n");
+            goto cleanup;
+        }
+
+        sent = sendto(sockfd, encoded, encoded_size, 0,
+                      (struct sockaddr *)&peer_addr, peer_len);
+
+        if (sent < 0 || (size_t)sent != encoded_size) {
+            if (sent < 0) {
+                perror("sendto");
+            } else {
+                fprintf(stderr, "Incomplete UDP send\n");
+            }
+
+            goto cleanup;
+        }
+    }
+
+    /*
+     * FIN was accepted. Linger briefly to ACK retransmitted FIN
+     * packets if the original final ACK was lost by the relay.
+     */
+    while (getTimeMs() - linger_start < linger_ms) {
+        struct pollfd pfd;
+        Packet packet;
+        Packet ack;
+        int poll_result;
+
+        uint64_t elapsed = getTimeMs() - linger_start;
+        int remaining = (int)(linger_ms - elapsed);
+
+        pfd.fd = sockfd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+
+        poll_result = poll(&pfd, 1, remaining);
+
+        if (poll_result < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            perror("poll during FIN linger");
+            goto cleanup;
+        }
+
+        if (poll_result == 0) {
+            break;
+        }
+
+        if (!(pfd.revents & POLLIN)) {
+            continue;
+        }
+
+        peer_len = sizeof(peer_addr);
+
+        received = recvfrom(sockfd, buffer, sizeof(buffer), 0,
+                            (struct sockaddr *)&peer_addr,
+                            &peer_len);
+
+        if (received < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            perror("recvfrom during FIN linger");
+            goto cleanup;
+        }
+
+        if (decodePacket(buffer, (size_t)received, &packet) != 0) {
+            continue;
+        }
+
+        /*
+         * A repeated FIN should receive the final cumulative ACK
+         * again. Ignore other packets during the linger period.
+         */
+        if (packet.type != PACKET_FIN) {
+            continue;
+        }
+
+        if (receiverHandleFin(&receiver, &packet,
+                              getTimeMs(), &ack) != 0) {
+            continue;
+        }
+
+        if (encodePacket(&ack, encoded, sizeof(encoded),
+                         &encoded_size) != 0) {
+            continue;
+        }
+
+        sent = sendto(sockfd, encoded, encoded_size, 0,
+                      (struct sockaddr *)&peer_addr, peer_len);
+
+        if (sent < 0 || (size_t)sent != encoded_size) {
+            if (sent < 0 && errno != EINTR) {
+                perror("sendto during FIN linger");
+                goto cleanup;
+            }
+        }
+    }
+
+    if (fflush(output) != 0) {
+        perror("fflush");
+        goto cleanup;
+    }
+
+    status = 0;
+
+cleanup:
+    if (results != NULL) {
+        freeaddrinfo(results);
+    }
+
+    if (sockfd >= 0) {
+        close(sockfd);
+    }
+
+    if (output != NULL) {
+        if (fclose(output) != 0) {
+            perror("fclose");
+            status = 1;
+        }
+    }
+
+    return status;
 }
 
 void printUsage(void)
