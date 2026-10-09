@@ -7,15 +7,9 @@
 #endif
 
 
+int main(int argc, char **argv){
 
-int main(void)
-{
-    char *greeting = get_greeting("World");
-    if (greeting) {
-        printf("%s\n", greeting);
-        free(greeting); // Free the allocated memory for the greeting
-    } else {
-        printf("Failed to create greeting.\n");
-    }
+    printUsage();
     return 0;
+
 }
