@@ -14,27 +14,28 @@
 #include <limits.h>
 
 
-uint16_t packetChecksum(const uint8_t *data, size_t length){
+uint16_t packetChecksum(const uint8_t *data, size_t length)
+{
+    uint32_t sum = 0U;
 
-    uint32_t sum = 0;
-
-    while (length > 1) {
-        /* Combine two bytes into one 16-bit word.*/
-        sum += ((uint16_t)data[0] << 8) | data[1];
+    while (length > 1U) {
+        /* Combine two bytes into one 16-bit word. */
+        sum += ((uint32_t)data[0] << 8U) | (uint32_t)data[1];
 
         data += 2;
-        length -= 2;
+        length -= 2U;
     }
 
-    if (length > 0) {
-        sum += (uint16_t)data[0] << 8;
+    if (length > 0U) {
+        sum += (uint32_t)data[0] << 8U;
     }
 
-    while (sum >> 16) {
-        sum = (sum & 0xffffU) + (sum >> 16);
+    /* Fold carries back into the lower 16 bits. */
+    while ((sum >> 16U) != 0U) {
+        sum = (sum & UINT32_C(0xffff)) + (sum >> 16U);
     }
 
-    return (uint16_t)~sum;
+    return (uint16_t)(~sum & UINT32_C(0xffff));
 }
 
 
@@ -67,7 +68,7 @@ int encodePacket(const Packet *packet, uint8_t *buffer, size_t buffer_size, size
     }
 
     /* Calculate the encoded packet size. */
-    total_size = HEADER_SIZE + packet->length;
+    total_size = (size_t)HEADER_SIZE + (size_t)packet->length;
 
     if (buffer_size < total_size) {
         return 1;
@@ -587,7 +588,7 @@ int receiverInit(ReceiverState *receiver)
     /* Initialize the receiver state. */
     receiver->expectedseqnum = 0;
     receiver->finished = 0;
-    receiver->last_activity = getTimeMs(); //FIXME is this ok..?
+    receiver->last_activity = getTimeMs(); 
 
     return 0;
 }
