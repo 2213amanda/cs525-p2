@@ -9,6 +9,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
+#include <sys/time.h>
 
 
 uint16_t packetChecksum(const uint8_t *data, size_t length){
@@ -344,77 +346,720 @@ int senderSendData(SenderState *sender, const uint8_t *data, uint16_t length, ui
 
 int senderHandleAck(SenderState *sender, uint32_t ack_seq, uint64_t now_ms)
 {
+    if (sender == NULL) {
+        return 1;
+    }
+
+    /*
+     * An ACK cannot acknowledge a sequence number beyond the
+     * next sequence number that has been sent.
+     */
+    if (ack_seq > sender->nextseqnum) {
+        return 1;
+    }
+
+    /*
+     * Duplicate or stale ACKs do not advance the sender's base.
+     */
+    if (ack_seq <= sender->base) {
+        return 0;
+    }
+
+    /*
+     * Advance base to the next packet the receiver expects.
+     * Because ACKs are cumulative, all packets before ack_seq
+     * are now acknowledged.
+     */
+    sender->base = ack_seq;
+
+    /*
+     * If no DATA packets remain unacknowledged, stop the timer.
+     * Otherwise, restart the timer for the oldest outstanding
+     * packet.
+     */
+    if (sender->base == sender->nextseqnum) {
+        sender->timer_running = 0;
+        sender->timer_start = 0;
+    } else {
+        sender->timer_start = now_ms;
+        sender->timer_running = 1;
+    }
+
+    /* A valid advancing ACK resets the consecutive timeout count. */
+    sender->consecutive_timeouts = 0;
+
     return 0;
 }
 
 int senderHandleTimeout(SenderState *sender, uint64_t now_ms, Packet *packets, size_t *count)
 {
+    uint32_t seq;
+    size_t num_packets = 0;
+
+    /* Validate arguments. */
+    if (sender == NULL || packets == NULL || count == NULL) {
+        return 1;
+    }
+
+    *count = 0;
+
+    /* A timeout can only be handled when the timer is running. */
+    if (!sender->timer_running) {
+        return 1;
+    }
+
+    /* Check whether the retransmission timer has expired. */
+    if (now_ms < sender->timer_start ||
+        now_ms - sender->timer_start < sender->timeout_ms) {
+        return 1;
+    }
+
+    /* No outstanding packets means there is nothing to retransmit. */
+    if (sender->base == sender->nextseqnum) {
+        sender->timer_running = 0;
+        sender->timer_start = 0;
+        return 0;
+    }
+
+    /* Ensure the outstanding packet count is within the configured window. */
+    if (sender->nextseqnum - sender->base > sender->window ||
+        sender->nextseqnum - sender->base > MAX_WINDOW) {
+        return 1;
+    }
+
+    /*
+     * Go-Back-N: retransmit every outstanding DATA packet,
+     * starting with the oldest unacknowledged packet.
+     */
+    for (seq = sender->base; seq < sender->nextseqnum; seq++) {
+        uint32_t index = seq % MAX_WINDOW;
+
+        packets[num_packets] = sender->packets[index];
+        num_packets++;
+    }
+
+    *count = num_packets;
+
+    /* Restart the timer for the retransmitted window. */
+    sender->timer_start = now_ms;
+    sender->timer_running = 1;
+
+    /* Record the timeout for retry-limit handling. */
+    sender->consecutive_timeouts++;
+
     return 0;
 }
 
 int senderTimerDue(const SenderState *sender, uint64_t now_ms, uint64_t *remaining_ms)
 {
+    uint64_t elapsed;
+
+    /* Validate arguments. */
+    if (sender == NULL || remaining_ms == NULL) {
+        return 1;
+    }
+
+    *remaining_ms = 0;
+
+    /* No active timer means there is no deadline to report. */
+    if (!sender->timer_running) {
+        return 1;
+    }
+
+    /* Guard against a timestamp earlier than the timer start. */
+    if (now_ms < sender->timer_start) {
+        *remaining_ms = sender->timeout_ms;
+        return 0;
+    }
+
+    elapsed = now_ms - sender->timer_start;
+
+    /* The timer has expired. */
+    if (elapsed >= sender->timeout_ms) {
+        *remaining_ms = 0;
+        return 0;
+    }
+
+    /* Calculate the time remaining until expiration. */
+    *remaining_ms = (uint64_t)sender->timeout_ms - elapsed;
+
     return 0;
 }
 
 int senderSendFin(SenderState *sender, uint64_t now_ms, Packet *packet)
 {
+    /* Validate arguments. */
+    if (sender == NULL || packet == NULL) {
+        return 1;
+    }
+
+    /* Do not send FIN while DATA packets remain unacknowledged. */
+    if (sender->base != sender->nextseqnum) {
+        return 1;
+    }
+
+    /* Do not send FIN more than once. */
+    if (sender->fin_sent) {
+        return 1;
+    }
+
+    /* Create the FIN packet using the next sequence number. */
+    if (makeFinPacket(packet, sender->nextseqnum) != 0) {
+        return 1;
+    }
+
+    /* Store a copy for retransmission if the FIN is lost. */
+    sender->fin = *packet;
+
+    /* Record that FIN has been sent. */
+    sender->fin_sent = 1;
+    sender->fin_acked = 0;
+
+    /* Start the retransmission timer. */
+    sender->timer_start = now_ms;
+    sender->timer_running = 1;
+
+    /* Reset the consecutive timeout counter for the FIN phase. */
+    sender->consecutive_timeouts = 0;
+
     return 0;
 }
 
 int senderHandleFinAck(SenderState *sender, uint32_t ack_seq, uint64_t now_ms)
 {
+    (void)now_ms; /* Not needed for this implementation. */
+
+    /* Validate the sender pointer. */
+    if (sender == NULL) {
+        return 1;
+    }
+
+    /* FIN must have been sent before its ACK can be accepted. */
+    if (!sender->fin_sent) {
+        return 1;
+    }
+
+    /* Ignore an ACK if FIN has already been acknowledged. */
+    if (sender->fin_acked) {
+        return 1;
+    }
+
+    /* The ACK must acknowledge the FIN sequence number. */
+    if (ack_seq != sender->fin.seq + 1U) {
+        return 1;
+    }
+
+    /* Mark FIN as acknowledged. */
+    sender->fin_acked = 1;
+
+    /* Stop the retransmission timer. */
+    sender->timer_running = 0;
+    sender->timer_start = 0;
+
     return 0;
 }
 
 int senderFinished(const SenderState *sender)
 {
+    /* Validate the sender pointer. */
+    if (sender == NULL) {
+        return 0;
+    }
+
+    /* All DATA packets and the FIN packet must be acknowledged. */
+    if (sender->base == sender->nextseqnum &&
+        sender->fin_sent &&
+        sender->fin_acked) {
+        return 1;
+    }
+
     return 0;
 }
 
 int receiverInit(ReceiverState *receiver)
 {
+    /* Validate the receiver pointer. */
+    if (receiver == NULL) {
+        return 1;
+    }
+
+    /* Initialize the receiver state. */
+    receiver->expectedseqnum = 0;
+    receiver->finished = 0;
+    receiver->last_activity = getTimeMs(); //FIXME is this ok..?
+
     return 0;
 }
 
 int receiverHandleData(ReceiverState *receiver, const Packet *packet, uint64_t now_ms, Packet *ack)
 {
+    if (receiver == NULL || packet == NULL || ack == NULL) {
+        return 1;
+    }
+
+    /* Only DATA packets can be handled by this function. */
+    if (packet->type != PACKET_DATA) {
+        return 1;
+    }
+
+    /* Reject malformed packets with an oversized payload. */
+    if (packet->length > MAX_PAYLOAD) {
+        return 1;
+    }
+
+    /* Do not process data after the receiver has finished. */
+    if (receiver->finished) {
+        return 1;
+    }
+
+    /*
+     * Go-Back-N receiver behavior:
+     * accept only the next expected sequence number.
+     */
+    if (packet->seq == receiver->expectedseqnum) {
+        receiver->expectedseqnum++;
+        receiver->last_activity = now_ms;
+    }
+
+    /*
+     * For an expected packet, duplicate, or out-of-order packet,
+     * acknowledge the next expected sequence number. This is a
+     * cumulative ACK: it tells the sender which sequence number
+     * the receiver is waiting for next.
+     */
+    if (makeAckPacket(ack, receiver->expectedseqnum) != 0) {
+        return 1;
+    }
+
     return 0;
 }
 
 int receiverHandleFin(ReceiverState *receiver, const Packet *packet, uint64_t now_ms, Packet *ack)
 {
+    if (receiver == NULL || packet == NULL || ack == NULL) {
+        return 1;
+    }
+
+    /* Only FIN packets can be handled by this function. */
+    if (packet->type != PACKET_FIN) {
+        return 1;
+    }
+
+    /* FIN packets must not contain a payload. */
+    if (packet->length != 0) {
+        return 1;
+    }
+
+    /*
+     * If the receiver has already finished, acknowledge a repeated
+     * FIN with the final cumulative ACK during the linger period.
+     */
+    if (receiver->finished) {
+        if (packet->seq == receiver->expectedseqnum - 1) {
+            if (makeAckPacket(ack, receiver->expectedseqnum) != 0) {
+                return 1;
+            }
+
+            receiver->last_activity = now_ms;
+            return 0;
+        }
+
+        return 1;
+    }
+
+    /*
+     * Accept FIN only when its sequence number equals the next
+     * expected DATA sequence number.
+     */
+    if (packet->seq != receiver->expectedseqnum) {
+        /* FIN arrived too early or out of order; ACK current expectation. */
+        if (makeAckPacket(ack, receiver->expectedseqnum) != 0) {
+            return 1;
+        }
+
+        return 0;
+    }
+
+    /*
+     * The FIN is in order. Advance the expected sequence number,
+     * mark the transfer as finished, and generate the final ACK.
+     */
+    receiver->expectedseqnum++;
+    receiver->finished = 1;
+    receiver->last_activity = now_ms;
+
+    if (makeAckPacket(ack, receiver->expectedseqnum) != 0) {
+        return 1;
+    }
+
     return 0;
 }
 
 int receiverTimerExpired(const ReceiverState *receiver, uint64_t now_ms)
 {
+    /* Reject an invalid receiver pointer. */
+    if (receiver == NULL) {
+        return 1;
+    }
+
+    /* Avoid unsigned underflow if the supplied time is earlier. */
+    if (now_ms < receiver->last_activity) {
+        return 0;
+    }
+
+    /* Expire after 30 seconds without activity. */
+    if (now_ms - receiver->last_activity >= 30000) {
+        return 1;
+    }
+
     return 0;
 }
 
 uint64_t getTimeMs(void)
 {
-    return 0;
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+
+    return ((uint64_t)ts.tv_sec * UINT64_C(1000))
+           + ((uint64_t)ts.tv_nsec / UINT64_C(1000000));
 }
 
 int resolveAddr(const char *host, const char *port, struct addrinfo **results)
 {
+    struct addrinfo hints;
+    int status;
+
+    /* Validate arguments. */
+    if (host == NULL || port == NULL || results == NULL) {
+        return 1;
+    }
+
+    /* Initialize the output pointer before attempting resolution. */
+    *results = NULL;
+
+    /* Configure address resolution for UDP. */
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;       /* IPv4 or IPv6 */
+    hints.ai_socktype = SOCK_DGRAM;    /* UDP */
+    hints.ai_protocol = IPPROTO_UDP;
+
+    /* Resolve the host and service (port). */
+    status = getaddrinfo(host, port, &hints, results);
+
+    if (status != 0) {
+        *results = NULL;
+        return 1;
+    }
+
     return 0;
 }
 
 int createSocket(const struct addrinfo *addr)
 {
-    return 0;
+    int sockfd;
+
+    if (addr == NULL) {
+        return -1;
+    }
+
+    sockfd = socket(addr->ai_family,
+                    addr->ai_socktype,
+                    addr->ai_protocol);
+
+    if (sockfd == -1) {
+        return -1;
+    }
+
+    return sockfd;
 }
 
 int registerReceiver(int sockfd, const struct sockaddr *relay, socklen_t relay_len, const char *session)
 {
-    return 0;
+    char hello[64];
+    char response[256];
+
+    /* Validate arguments. */
+    if (sockfd < 0 || relay == NULL || session == NULL) {
+        return 1;
+    }
+
+    /* Validate the session length: 1 to 32 characters. */
+    size_t session_len = strlen(session);
+
+    if (session_len < 1 || session_len > 32) {
+        return 1;
+    }
+
+    /* Validate session characters: a-z, 0-9, and hyphen. */
+    for (size_t i = 0; i < session_len; i++) {
+        char c = session[i];
+
+        if (!((c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') ||
+              c == '-')) {
+            return 1;
+        }
+    }
+
+    /* Construct the registration message without a newline. */
+    int hello_len = snprintf(hello, sizeof(hello),
+                             "HELLO %s recv", session);
+
+    if (hello_len < 0 || (size_t)hello_len >= sizeof(hello)) {
+        return 1;
+    }
+
+    /* Set a one-second receive timeout. */
+    struct timeval timeout;
+    timeout.tv_sec = 1;
+    timeout.tv_usec = 0;
+
+    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO,
+                   &timeout, sizeof(timeout)) < 0) {
+        return 1;
+    }
+
+    /* Retry registration up to five times. */
+    for (int attempt = 0; attempt < 5; attempt++) {
+
+        ssize_t sent = sendto(sockfd,
+                              hello,
+                              (size_t)hello_len,
+                              0,
+                              relay,
+                              relay_len);
+
+        if (sent < 0 || sent != hello_len) {
+            continue;
+        }
+
+        struct sockaddr_storage sender_addr;
+        socklen_t sender_len = sizeof(sender_addr);
+
+        ssize_t received = recvfrom(sockfd,
+                                    response,
+                                    sizeof(response) - 1,
+                                    0,
+                                    (struct sockaddr *)&sender_addr,
+                                    &sender_len);
+
+        if (received < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK ||
+                errno == EINTR) {
+                continue;
+            }
+
+            return 1;
+        }
+
+        response[received] = '\0';
+
+        /* Ignore datagrams that did not come from the relay. */
+        if (sender_len != relay_len ||
+            sender_addr.ss_family != relay->sa_family) {
+            continue;
+        }
+
+        int same_address = 0;
+
+        if (relay->sa_family == AF_INET) {
+            const struct sockaddr_in *expected =
+                (const struct sockaddr_in *)relay;
+            const struct sockaddr_in *actual =
+                (const struct sockaddr_in *)&sender_addr;
+
+            same_address =
+                expected->sin_port == actual->sin_port &&
+                expected->sin_addr.s_addr == actual->sin_addr.s_addr;
+        } else if (relay->sa_family == AF_INET6) {
+            const struct sockaddr_in6 *expected =
+                (const struct sockaddr_in6 *)relay;
+            const struct sockaddr_in6 *actual =
+                (const struct sockaddr_in6 *)&sender_addr;
+
+            same_address =
+                expected->sin6_port == actual->sin6_port &&
+                memcmp(&expected->sin6_addr, &actual->sin6_addr,
+                       sizeof(expected->sin6_addr)) == 0 &&
+                expected->sin6_scope_id == actual->sin6_scope_id;
+        }
+
+        if (!same_address) {
+            continue;
+        }
+
+        /* Registration succeeded. */
+        if (strcmp(response, "OK") == 0) {
+            return 0;
+        }
+
+        /* The relay explicitly rejected registration. */
+        if (strncmp(response, "ERR ", 4) == 0) {
+            fprintf(stderr, "Receiver registration failed: %s\n",
+                    response + 4);
+            return 1;
+        }
+
+        /* Unexpected response: retry registration. */
+    }
+
+    fprintf(stderr,
+            "Receiver registration failed: no valid OK response "
+            "after 5 attempts\n");
+
+    return 1;
 }
 
 int registerSender(int sockfd, const struct sockaddr *relay, socklen_t relay_len, const char *session, double loss, double corrupt, double dup)
 {
-    return 0;
+    char hello[128];
+    char response[256];
+    size_t session_len;
+    int hello_len;
+
+    /* Validate arguments. */
+    if (sockfd < 0 || relay == NULL || session == NULL) {
+        return 1;
+    }
+
+    /* Validate session length. */
+    session_len = strlen(session);
+
+    if (session_len < 1 || session_len > 32) {
+        return 1;
+    }
+
+    /* Validate session characters. */
+    for (size_t i = 0; i < session_len; i++) {
+        char c = session[i];
+
+        if (!((c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') ||
+              c == '-')) {
+            return 1;
+        }
+    }
+
+    /* Validate probabilities: each must be between 0 and 0.5. */
+    if (loss < 0.0 || loss > 0.5 ||
+        corrupt < 0.0 || corrupt > 0.5 ||
+        dup < 0.0 || dup > 0.5) {
+        return 1;
+    }
+
+    /* Construct the HELLO message without a newline. */
+    hello_len = snprintf(hello, sizeof(hello),
+                         "HELLO %s send %.6g %.6g %.6g",
+                         session, loss, corrupt, dup);
+
+    if (hello_len < 0 || (size_t)hello_len >= sizeof(hello)) {
+        return 1;
+    }
+
+    /* Set a one-second receive timeout. */
+    struct timeval timeout;
+    timeout.tv_sec = 1;
+    timeout.tv_usec = 0;
+
+    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO,
+                   &timeout, sizeof(timeout)) < 0) {
+        perror("setsockopt");
+        return 1;
+    }
+
+    /* Attempt registration up to five times. */
+    for (int attempt = 0; attempt < 5; attempt++) {
+        ssize_t sent = sendto(sockfd,
+                              hello,
+                              (size_t)hello_len,
+                              0,
+                              relay,
+                              relay_len);
+
+        if (sent < 0 || sent != hello_len) {
+            continue;
+        }
+
+        struct sockaddr_storage sender_addr;
+        socklen_t sender_len = sizeof(sender_addr);
+
+        ssize_t received = recvfrom(sockfd,
+                                    response,
+                                    sizeof(response) - 1,
+                                    0,
+                                    (struct sockaddr *)&sender_addr,
+                                    &sender_len);
+
+        if (received < 0) {
+            if (errno == EINTR ||
+                errno == EAGAIN ||
+                errno == EWOULDBLOCK) {
+                continue;
+            }
+
+            perror("recvfrom");
+            return 1;
+        }
+
+        response[received] = '\0';
+
+        /* Verify that the response came from the relay. */
+        if (sender_len != relay_len ||
+            sender_addr.ss_family != relay->sa_family) {
+            continue;
+        }
+
+        int same_address = 0;
+
+        if (relay->sa_family == AF_INET) {
+            const struct sockaddr_in *expected =
+                (const struct sockaddr_in *)relay;
+            const struct sockaddr_in *actual =
+                (const struct sockaddr_in *)&sender_addr;
+
+            same_address =
+                expected->sin_port == actual->sin_port &&
+                expected->sin_addr.s_addr == actual->sin_addr.s_addr;
+        } else if (relay->sa_family == AF_INET6) {
+            const struct sockaddr_in6 *expected =
+                (const struct sockaddr_in6 *)relay;
+            const struct sockaddr_in6 *actual =
+                (const struct sockaddr_in6 *)&sender_addr;
+
+            same_address =
+                expected->sin6_port == actual->sin6_port &&
+                expected->sin6_scope_id == actual->sin6_scope_id &&
+                memcmp(&expected->sin6_addr,
+                       &actual->sin6_addr,
+                       sizeof(expected->sin6_addr)) == 0;
+        }
+
+        if (!same_address) {
+            continue;
+        }
+
+        /* Relay accepted registration. */
+        if (strcmp(response, "OK") == 0) {
+            return 0;
+        }
+
+        /* Relay explicitly rejected registration. */
+        if (strncmp(response, "ERR ", 4) == 0) {
+            fprintf(stderr, "Sender registration failed: %s\n",
+                    response + 4);
+            return 1;
+        }
+
+        /* Unexpected response: retry. */
+    }
+
+    fprintf(stderr,
+            "Sender registration failed after 5 attempts\n");
+
+    return 1;
 }
 
 int runSender(const char *relay, const char *port, const char *session, const char *filename, uint32_t window, uint32_t timeout_ms, double loss, double corrupt, double dup)
