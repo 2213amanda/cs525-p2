@@ -12,6 +12,7 @@
 #include <sys/time.h>
 #include <signal.h>
 #include <poll.h>
+#include <stdint.h>
 
 #define TEST_PORT_SIZE 16
 #define TEST_TIMEOUT_MS 3000
@@ -1563,6 +1564,36 @@ void test_senderHandleTimeout_noOutstandingPackets(void)
     TEST_ASSERT_EQUAL_UINT64(0, sender.timer_start);
 }
 
+void test_senderHandleTimeout_exceedsConfiguredWindow(void)
+{
+    SenderState sender;
+    Packet packets[MAX_WINDOW];
+    size_t count = 0;
+
+    /* Initialize a valid sender state. */
+    TEST_ASSERT_EQUAL_INT(
+        0, senderInit(&sender, 4, 100)
+    );
+
+    /* Set up an expired timer. */
+    sender.timer_running = 1;
+    sender.timer_start = 1000;
+    sender.timeout_ms = 100;
+
+    /* Outstanding packet count = 5, window = 4. */
+    sender.base = 0;
+    sender.nextseqnum = 5;
+    sender.window = 4;
+
+    TEST_ASSERT_EQUAL_INT(
+        1,
+        senderHandleTimeout(
+            &sender, 1100, packets, &count
+        )
+    );
+
+    TEST_ASSERT_EQUAL_UINT(0, count);
+}
 
 // test getTimeMs
 
@@ -3178,6 +3209,170 @@ void test_registerReceiver_invalidSocket(void)
             "ta-2"));
 }
 
+void test_registerReceiver_ipv6_address_check(void)
+{
+    int client_fd = -1;
+    int test_relay_fd = -1;
+    int wrong_fd = -1;
+    pid_t child_pid = -1;
+
+    struct sockaddr_in6 relay6 = {0};
+    struct sockaddr_in6 wrong6 = {0};
+
+    client_fd = socket(AF_INET6, SOCK_DGRAM, 0);
+    test_relay_fd = socket(AF_INET6, SOCK_DGRAM, 0);
+    wrong_fd = socket(AF_INET6, SOCK_DGRAM, 0);
+
+    TEST_ASSERT_TRUE(client_fd >= 0);
+    TEST_ASSERT_TRUE(test_relay_fd >= 0);
+    TEST_ASSERT_TRUE(wrong_fd >= 0);
+
+    relay6.sin6_family = AF_INET6;
+    relay6.sin6_addr = in6addr_loopback;
+    relay6.sin6_port = 0;
+
+    wrong6.sin6_family = AF_INET6;
+    wrong6.sin6_addr = in6addr_loopback;
+    wrong6.sin6_port = 0;
+
+    TEST_ASSERT_EQUAL_INT(
+        0, bind(test_relay_fd, (struct sockaddr *)&relay6, sizeof(relay6)));
+    TEST_ASSERT_EQUAL_INT(
+        0, bind(wrong_fd, (struct sockaddr *)&wrong6, sizeof(wrong6)));
+
+    socklen_t relay_len = sizeof(relay6);
+    socklen_t wrong_len = sizeof(wrong6);
+
+    TEST_ASSERT_EQUAL_INT(
+        0, getsockname(test_relay_fd, (struct sockaddr *)&relay6, &relay_len));
+    TEST_ASSERT_EQUAL_INT(
+        0, getsockname(wrong_fd, (struct sockaddr *)&wrong6, &wrong_len));
+
+    child_pid = fork();
+    TEST_ASSERT_TRUE(child_pid >= 0);
+
+    if (child_pid == 0) {
+        char buffer[128];
+        struct sockaddr_storage client_addr;
+        socklen_t client_len = sizeof(client_addr);
+
+        ssize_t received = recvfrom(
+            test_relay_fd, buffer, sizeof(buffer) - 1, 0,
+            (struct sockaddr *)&client_addr, &client_len);
+
+        if (received < 0) {
+            _exit(2);
+        }
+
+        buffer[received] = '\0';
+
+        if (strcmp(buffer, "HELLO ta-2 recv") != 0) {
+            _exit(3);
+        }
+
+        /* Send an invalid reply from a different IPv6 port. */
+        if (sendto(wrong_fd, "OK", 2, 0,
+                   (struct sockaddr *)&client_addr, client_len) != 2) {
+            _exit(4);
+        }
+
+        /* Then send the valid reply from the expected relay address. */
+        if (sendto(test_relay_fd, "OK", 2, 0,
+                   (struct sockaddr *)&client_addr, client_len) != 2) {
+            _exit(5);
+        }
+
+        _exit(0);
+    }
+
+    int result = registerReceiver(
+        client_fd, (struct sockaddr *)&relay6, relay_len, "ta-2");
+
+    TEST_ASSERT_EQUAL_INT(0, result);
+
+    int status = 0;
+    TEST_ASSERT_EQUAL_INT(child_pid, waitpid(child_pid, &status, 0));
+    TEST_ASSERT_TRUE(WIFEXITED(status));
+    TEST_ASSERT_EQUAL_INT(0, WEXITSTATUS(status));
+
+    close(client_fd);
+    close(test_relay_fd);
+    close(wrong_fd);
+}
+
+void test_registerReceiver_fails_after_five_attempts(void)
+{
+    int client_fd = -1;
+    int test_relay_fd = -1;
+    pid_t child_pid = -1;
+
+    struct sockaddr_in relay = {0};
+
+    client_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    test_relay_fd = socket(AF_INET, SOCK_DGRAM, 0);
+
+    TEST_ASSERT_TRUE(client_fd >= 0);
+    TEST_ASSERT_TRUE(test_relay_fd >= 0);
+
+    relay.sin_family = AF_INET;
+    relay.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    relay.sin_port = 0;
+
+    TEST_ASSERT_EQUAL_INT(
+        0, bind(test_relay_fd, (struct sockaddr *)&relay, sizeof(relay)));
+
+    socklen_t relay_len = sizeof(relay);
+    TEST_ASSERT_EQUAL_INT(
+        0, getsockname(test_relay_fd, (struct sockaddr *)&relay, &relay_len));
+
+    child_pid = fork();
+    TEST_ASSERT_TRUE(child_pid >= 0);
+
+    if (child_pid == 0) {
+        char buffer[128];
+
+        for (int i = 0; i < 5; i++) {
+            struct sockaddr_storage client_addr;
+            socklen_t client_len = sizeof(client_addr);
+
+            ssize_t received = recvfrom(
+                test_relay_fd, buffer, sizeof(buffer) - 1, 0,
+                (struct sockaddr *)&client_addr, &client_len);
+
+            if (received < 0) {
+                _exit(2);
+            }
+
+            buffer[received] = '\0';
+
+            if (strcmp(buffer, "HELLO ta-2 recv") != 0) {
+                _exit(3);
+            }
+
+            /* Reply with an invalid response on every attempt. */
+            if (sendto(test_relay_fd, "NOPE", 4, 0,
+                       (struct sockaddr *)&client_addr, client_len) != 4) {
+                _exit(4);
+            }
+        }
+
+        _exit(0);
+    }
+
+    int result = registerReceiver(
+        client_fd, (struct sockaddr *)&relay, relay_len, "ta-2");
+
+    TEST_ASSERT_EQUAL_INT(1, result);
+
+    int status = 0;
+    TEST_ASSERT_EQUAL_INT(child_pid, waitpid(child_pid, &status, 0));
+    TEST_ASSERT_TRUE(WIFEXITED(status));
+    TEST_ASSERT_EQUAL_INT(0, WEXITSTATUS(status));
+
+    close(client_fd);
+    close(test_relay_fd);
+}
+
 // test registerSender
 
 /* Test successful sender registration. */
@@ -3366,6 +3561,201 @@ void test_registerSender_invalidSocket(void)
             sizeof(relay_addr),
             "ta-2",
             0.1, 0.05, 0.0));
+}
+
+void test_registerSender_ipv6_success(void)
+{
+    /* Create an IPv6 UDP relay socket. */
+    relay_fd = socket(AF_INET6, SOCK_DGRAM, 0);
+    TEST_ASSERT_TRUE(relay_fd >= 0);
+
+    struct sockaddr_in6 relay_addr6;
+    memset(&relay_addr6, 0, sizeof(relay_addr6));
+
+    relay_addr6.sin6_family = AF_INET6;
+    relay_addr6.sin6_addr = in6addr_loopback;
+    relay_addr6.sin6_port = 0;
+
+    TEST_ASSERT_EQUAL_INT(
+        0,
+        bind(relay_fd,
+             (struct sockaddr *)&relay_addr6,
+             sizeof(relay_addr6)));
+
+    socklen_t relay_len = sizeof(relay_addr6);
+
+    TEST_ASSERT_EQUAL_INT(
+        0,
+        getsockname(relay_fd,
+                    (struct sockaddr *)&relay_addr6,
+                    &relay_len));
+
+    /* Fork a child process to act as the relay. */
+    relay_pid = fork();
+    TEST_ASSERT_TRUE(relay_pid >= 0);
+
+    if (relay_pid == 0) {
+        char buffer[128];
+        struct sockaddr_in6 client_addr;
+        socklen_t client_len = sizeof(client_addr);
+
+        ssize_t received = recvfrom(
+            relay_fd,
+            buffer,
+            sizeof(buffer) - 1,
+            0,
+            (struct sockaddr *)&client_addr,
+            &client_len);
+
+        if (received < 0) {
+            _exit(1);
+        }
+
+        buffer[received] = '\0';
+
+        if (strcmp(buffer, "HELLO ta-2 send 0.1 0.05 0") != 0) {
+            _exit(2);
+        }
+
+        const char response[] = "OK";
+
+        ssize_t sent = sendto(
+            relay_fd,
+            response,
+            sizeof(response) - 1,
+            0,
+            (struct sockaddr *)&client_addr,
+            client_len);
+
+        _exit(sent == (ssize_t)(sizeof(response) - 1) ? 0 : 3);
+    }
+
+    /* Create an IPv6 client socket. */
+    int sockfd = socket(AF_INET6, SOCK_DGRAM, 0);
+    TEST_ASSERT_TRUE(sockfd >= 0);
+
+    /* Register the sender using an IPv6 relay address. */
+    int result = registerSender(
+        sockfd,
+        (const struct sockaddr *)&relay_addr6,
+        sizeof(relay_addr6),
+        "ta-2",
+        0.1,
+        0.05,
+        0.0);
+
+    close(sockfd);
+
+    TEST_ASSERT_EQUAL_INT(0, result);
+}
+
+void test_registerSender_wrongRelayAddress(void)
+{
+    /* Socket representing the expected relay address. */
+    relay_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    TEST_ASSERT_TRUE(relay_fd >= 0);
+
+    memset(&relay_addr, 0, sizeof(relay_addr));
+    relay_addr.sin_family = AF_INET;
+    relay_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    relay_addr.sin_port = 0;
+
+    TEST_ASSERT_EQUAL_INT(
+        0,
+        bind(relay_fd,
+             (struct sockaddr *)&relay_addr,
+             sizeof(relay_addr)));
+
+    socklen_t relay_len = sizeof(relay_addr);
+    TEST_ASSERT_EQUAL_INT(
+        0,
+        getsockname(relay_fd,
+                    (struct sockaddr *)&relay_addr,
+                    &relay_len));
+
+    /* Create a different socket to send the response. */
+    int wrong_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    TEST_ASSERT_TRUE(wrong_fd >= 0);
+
+    struct sockaddr_in wrong_addr;
+    memset(&wrong_addr, 0, sizeof(wrong_addr));
+    wrong_addr.sin_family = AF_INET;
+    wrong_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    wrong_addr.sin_port = 0;
+
+    TEST_ASSERT_EQUAL_INT(
+        0,
+        bind(wrong_fd,
+             (struct sockaddr *)&wrong_addr,
+             sizeof(wrong_addr)));
+
+    socklen_t wrong_len = sizeof(wrong_addr);
+    TEST_ASSERT_EQUAL_INT(
+        0,
+        getsockname(wrong_fd,
+                    (struct sockaddr *)&wrong_addr,
+                    &wrong_len));
+
+    relay_pid = fork();
+    TEST_ASSERT_TRUE(relay_pid >= 0);
+
+    if (relay_pid == 0) {
+        /* Keep relay_fd open so HELLO reaches the child. */
+
+        for (int i = 0; i < 5; i++) {
+            char buffer[128];
+            struct sockaddr_in client_addr;
+            socklen_t client_len = sizeof(client_addr);
+
+            ssize_t received = recvfrom(
+                relay_fd,
+                buffer,
+                sizeof(buffer),
+                0,
+                (struct sockaddr *)&client_addr,
+                &client_len
+            );
+
+            if (received < 0) {
+                _exit(1);
+            }
+
+            /* Respond from a different port than relay_fd. */
+            ssize_t sent = sendto(
+                wrong_fd,
+                "OK",
+                2,
+                0,
+                (struct sockaddr *)&client_addr,
+                client_len
+            );
+
+            if (sent != 2) {
+                _exit(2);
+            }
+        }
+
+        _exit(0);
+    }
+
+    close(wrong_fd);
+
+    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    TEST_ASSERT_TRUE(sockfd >= 0);
+
+    int result = registerSender(
+        sockfd,
+        (const struct sockaddr *)&relay_addr,
+        sizeof(relay_addr),
+        "ta-2",
+        0.1,
+        0.05,
+        0.0);
+
+    close(sockfd);
+
+    /* No response came from the expected relay address. */
+    TEST_ASSERT_NOT_EQUAL(0, result);
 }
 
 // runSender tests
@@ -3987,6 +4377,440 @@ void test_runReceiver_outOfOrderData(void)
     TEST_ASSERT_EQUAL_INT(0, fclose(file));
 }
 
+
+/*
+ * A complete transfer with packet loss, corruption, and duplication.
+ * 
+ */
+
+/* Keep the test bounded and reproducible. */
+#define TEST_DATA_SIZE (MAX_PAYLOAD * 100U + 37U)
+#define TEST_QUEUE_CAPACITY 512U
+#define TEST_RELAY_TIMEOUT_MS 25U
+#define TEST_MAX_STEPS 2000000U
+
+typedef struct {
+    uint8_t data[MAX_PACKET_SIZE];
+    size_t length;
+} TestDatagram;
+
+typedef struct {
+    TestDatagram items[TEST_QUEUE_CAPACITY];
+    size_t head;
+    size_t count;
+} TestChannel;
+
+typedef struct {
+    unsigned int dropped;
+    unsigned int corrupted;
+    unsigned int duplicated;
+} TestFaultStats;
+
+/* Two independent in-memory channels. */
+static TestChannel data_channel;
+static TestChannel ack_channel;
+
+static TestFaultStats data_faults;
+static TestFaultStats ack_faults;
+
+/* Queue one datagram without applying additional faults. */
+static int testQueuePush(TestChannel *channel,
+                         const uint8_t *data,
+                         size_t length)
+{
+    size_t index;
+
+    if (channel == NULL || data == NULL ||
+        length > MAX_PACKET_SIZE ||
+        channel->count >= TEST_QUEUE_CAPACITY) {
+        return 1;
+    }
+
+    index = (channel->head + channel->count) %
+            TEST_QUEUE_CAPACITY;
+
+    memcpy(channel->items[index].data, data, length);
+    channel->items[index].length = length;
+    channel->count++;
+
+    return 0;
+}
+
+/* Remove one datagram from a channel. */
+static int testQueuePop(TestChannel *channel,
+                        TestDatagram *datagram)
+{
+    if (channel == NULL || datagram == NULL ||
+        channel->count == 0U) {
+        return 1;
+    }
+
+    *datagram = channel->items[channel->head];
+
+    channel->head =
+        (channel->head + 1U) % TEST_QUEUE_CAPACITY;
+
+    channel->count--;
+
+    return 0;
+}
+
+/*
+ * Simulate a lossy, corrupting, duplicating network.
+ *
+ * Drop, corruption, and duplication are independent events,
+ * each with probability 20%.
+ *
+ * A corrupted datagram has one randomly selected bit flipped.
+ */
+static int testTransmit(TestChannel *channel,
+                        const uint8_t *data,
+                        size_t length,
+                        TestFaultStats *stats)
+{
+    uint8_t damaged[MAX_PACKET_SIZE];
+    int drop;
+    int corrupt;
+    int duplicate;
+
+    if (channel == NULL || data == NULL || stats == NULL ||
+        length == 0U || length > MAX_PACKET_SIZE) {
+        return 1;
+    }
+
+    /* One independent random trial per fault type. */
+    drop = (rand() % 100) < 20;
+    corrupt = (rand() % 100) < 20;
+    duplicate = (rand() % 100) < 20;
+
+    if (drop) {
+        stats->dropped++;
+        return 0;
+    }
+
+    memcpy(damaged, data, length);
+
+    if (corrupt) {
+        size_t byte_index = (size_t)rand() % length;
+        unsigned int bit_index = (unsigned int)rand() % 8U;
+
+        damaged[byte_index] ^=
+            (uint8_t)(1U << bit_index);
+
+        stats->corrupted++;
+    }
+
+    if (testQueuePush(channel, damaged, length) != 0) {
+        return 1;
+    }
+
+    if (duplicate) {
+        if (testQueuePush(channel, damaged, length) != 0) {
+            return 1;
+        }
+
+        stats->duplicated++;
+    }
+
+    return 0;
+}
+
+static int testQueueEncodedPacket(
+    TestChannel *channel,
+    const Packet *packet,
+    TestFaultStats *stats)
+{
+    uint8_t encoded[MAX_PACKET_SIZE];
+    size_t encoded_length = 0;
+
+    if (encodePacket(packet, encoded, sizeof(encoded),
+                     &encoded_length) != 0) {
+        return 1;
+    }
+
+    return testTransmit(
+        channel,
+        encoded,
+        encoded_length,
+        stats
+    );
+}
+
+/*
+ * Process one datagram from the sender-to-receiver channel.
+ *
+ * Valid in-order DATA is copied into the simulated destination file.
+ * The receiver's cumulative ACK is transmitted through the reverse
+ * channel, where it is subject to its own faults.
+ */
+static int testProcessData(TestChannel *channel,
+                           ReceiverState *receiver,
+                           uint8_t *output,
+                           size_t output_capacity,
+                           size_t *output_length,
+                           uint64_t now_ms)
+{
+    TestDatagram datagram;
+    Packet packet;
+    Packet ack;
+    uint32_t expected_before;
+
+    if (testQueuePop(channel, &datagram) != 0) {
+        return 0; /* No datagram available. */
+    }
+
+    /* Corrupted or malformed packets are discarded. */
+    if (decodePacket(datagram.data, datagram.length,
+                     &packet) != 0) {
+        return 0;
+    }
+
+    if (packet.type == PACKET_DATA) {
+        expected_before = receiver->expectedseqnum;
+
+        if (receiverHandleData(receiver, &packet,
+                               now_ms, &ack) != 0) {
+            return 1;
+        }
+
+        /*
+         * Write only a packet that was expected before handling it.
+         * This models the receiver application writing accepted bytes.
+         */
+        if (packet.seq == expected_before) {
+            if ((size_t)packet.length >
+                output_capacity - *output_length) {
+                return 1;
+            }
+
+            memcpy(output + *output_length,
+                   packet.payload, packet.length);
+
+            *output_length += packet.length;
+        }
+    } else if (packet.type == PACKET_FIN) {
+        if (receiverHandleFin(receiver, &packet,
+                              now_ms, &ack) != 0) {
+            return 1;
+        }
+    } else {
+        return 0; /* ACKs are not receiver-bound data. */
+    }
+
+    return testQueueEncodedPacket(&ack_channel, &ack, &ack_faults);
+}
+
+/* Process one reverse-channel datagram at the sender. */
+static int testProcessAck(TestChannel *channel,
+                          SenderState *sender,
+                          uint64_t now_ms)
+{
+    TestDatagram datagram;
+    Packet packet;
+
+    if (testQueuePop(channel, &datagram) != 0) {
+        return 0;
+    }
+
+    if (decodePacket(datagram.data, datagram.length,
+                     &packet) != 0) {
+        return 0;
+    }
+
+    if (packet.type != PACKET_ACK) {
+        return 0;
+    }
+
+    if (sender->fin_sent && !sender->fin_acked) {
+        /*
+         * Ignore unrelated ACKs, including stale DATA ACKs.
+         */
+        (void)senderHandleFinAck(sender, packet.seq, now_ms);
+    } else {
+        (void)senderHandleAck(sender, packet.seq, now_ms);
+    }
+
+    return 0;
+}
+
+void test_completeTransfer_withLossCorruptionAndDuplication(void)
+{
+    static uint8_t source[TEST_DATA_SIZE];
+    static uint8_t destination[TEST_DATA_SIZE];
+
+    SenderState sender;
+    ReceiverState receiver;
+
+    size_t source_offset = 0U;
+    size_t destination_length = 0U;
+
+    uint64_t now_ms = 0U;
+    unsigned int steps;
+
+    memset(&data_channel, 0, sizeof(data_channel));
+    memset(&ack_channel, 0, sizeof(ack_channel));
+    memset(&data_faults, 0, sizeof(data_faults));
+    memset(&ack_faults, 0, sizeof(ack_faults));
+    memset(destination, 0, sizeof(destination));
+
+    /*
+     * Fixed seed: the same packet-fault sequence is generated
+     * on each run with the same C library implementation.
+     */
+    srand(0x5255U);
+
+    /* Use a nontrivial binary payload with varied byte values. */
+    for (size_t i = 0U; i < sizeof(source); i++) {
+        source[i] = (uint8_t)((i * 37U + i / 7U + 19U) % 256U);
+    }
+
+    TEST_ASSERT_EQUAL_INT(
+        0, senderInit(&sender, 8U, TEST_RELAY_TIMEOUT_MS));
+
+    TEST_ASSERT_EQUAL_INT(0, receiverInit(&receiver));
+
+    /*
+     * Drive both state machines until FIN is acknowledged.
+     * Time advances deterministically rather than using a clock.
+     */
+    for (steps = 0U;
+         steps < TEST_MAX_STEPS && !senderFinished(&sender);
+         steps++, now_ms++) {
+
+        /*
+         * Fill the Go-Back-N window with DATA packets.
+         */
+        while (source_offset < sizeof(source) &&
+               sender.nextseqnum - sender.base < sender.window) {
+
+            size_t remaining = sizeof(source) - source_offset;
+            uint16_t chunk_length =
+                (uint16_t)(remaining > MAX_PAYLOAD
+                           ? MAX_PAYLOAD : remaining);
+
+            Packet packet;
+
+            TEST_ASSERT_EQUAL_INT(
+                0,
+                senderSendData(&sender,
+                               source + source_offset,
+                               chunk_length,
+                               now_ms,
+                               &packet));
+
+            TEST_ASSERT_EQUAL_INT(
+                0,
+                testQueueEncodedPacket(&data_channel, &packet, &data_faults));
+
+            source_offset += chunk_length;
+        }
+
+        /*
+         * Process at most one DATA/FIN and one ACK per iteration.
+         * This permits queued duplicates and reordering caused by
+         * retransmission to be exercised.
+         */
+        TEST_ASSERT_EQUAL_INT(
+            0,
+            testProcessData(&data_channel, &receiver,
+                            destination, sizeof(destination),
+                            &destination_length, now_ms));
+
+        TEST_ASSERT_EQUAL_INT(
+            0,
+            testProcessAck(&ack_channel, &sender, now_ms));
+
+        /*
+         * Send FIN after all source bytes have been queued and all
+         * DATA packets have been acknowledged.
+         */
+        if (source_offset == sizeof(source) &&
+            sender.base == sender.nextseqnum &&
+            !sender.fin_sent) {
+
+            Packet fin;
+
+            TEST_ASSERT_EQUAL_INT(
+                0, senderSendFin(&sender, now_ms, &fin));
+
+            TEST_ASSERT_EQUAL_INT(
+                0, testQueueEncodedPacket(&data_channel, &fin, &data_faults));
+        }
+
+        /*
+         * Expire the oldest outstanding DATA timer and retransmit
+         * all unacknowledged DATA packets.
+         */
+        if (sender.timer_running &&
+            now_ms >= sender.timer_start &&
+            now_ms - sender.timer_start >= sender.timeout_ms) {
+
+            if (sender.base < sender.nextseqnum) {
+                Packet retransmissions[MAX_WINDOW];
+                size_t retransmission_count = 0U;
+
+                TEST_ASSERT_EQUAL_INT(
+                    0,
+                    senderHandleTimeout(&sender, now_ms,
+                                        retransmissions,
+                                        &retransmission_count));
+
+                for (size_t i = 0U;
+                     i < retransmission_count; i++) {
+                    TEST_ASSERT_EQUAL_INT(
+                        0,
+                        testQueueEncodedPacket(&data_channel,
+                                       &retransmissions[i],
+                                       &data_faults));
+                }
+            } else if (sender.fin_sent && !sender.fin_acked) {
+                /*
+                 * FIN is not included in senderHandleTimeout's DATA
+                 * retransmission window, so retry it separately.
+                 */
+                TEST_ASSERT_EQUAL_INT(
+                    0,
+                    testQueueEncodedPacket(&data_channel,
+                                   &sender.fin, &data_faults));
+
+                sender.timer_start = now_ms;
+                sender.timer_running = 1;
+            }
+        }
+    }
+
+    /* Fail explicitly if the transfer did not complete. */
+    TEST_ASSERT_TRUE_MESSAGE(
+        senderFinished(&sender),
+        "Transfer did not complete before the step limit");
+
+    TEST_ASSERT_TRUE(receiver.finished);
+
+    /* Every source byte must have been delivered, exactly once. */
+    TEST_ASSERT_EQUAL_UINT(sizeof(source), source_offset);
+    TEST_ASSERT_EQUAL_UINT(sizeof(source), destination_length);
+
+    TEST_ASSERT_EQUAL_MEMORY(
+        source, destination, sizeof(source));
+
+    /*
+     * With this fixed seed and sufficiently many packets, the test
+     * should exercise each of the three fault types in both directions.
+     */
+    TEST_ASSERT_TRUE(data_faults.dropped > 0U);
+    TEST_ASSERT_TRUE(data_faults.corrupted > 0U);
+    TEST_ASSERT_TRUE(data_faults.duplicated > 0U);
+
+    TEST_ASSERT_TRUE(ack_faults.dropped > 0U);
+    TEST_ASSERT_TRUE(ack_faults.corrupted > 0U);
+    TEST_ASSERT_TRUE(ack_faults.duplicated > 0U);
+}
+
+
+
+
+ 
+
 int main(void) {
   UNITY_BEGIN();
   RUN_TEST(test_packetChecksum_empty);
@@ -4087,6 +4911,8 @@ int main(void) {
     RUN_TEST(test_senderHandleTimeout_timeWentBackward);
     RUN_TEST(test_senderHandleTimeout_exactExpiration);
     RUN_TEST(test_senderHandleTimeout_noOutstandingPackets);
+    RUN_TEST(test_senderHandleTimeout_exceedsConfiguredWindow);
+
 
     RUN_TEST(test_getTimeMs_returns_nonzero);
     RUN_TEST(test_getTimeMs_is_monotonic);
@@ -4196,6 +5022,8 @@ int main(void) {
     RUN_TEST(test_registerReceiver_invalidSessionCharacter);
     RUN_TEST(test_registerReceiver_sessionTooLong);
     RUN_TEST(test_registerReceiver_invalidSocket);
+    RUN_TEST(test_registerReceiver_ipv6_address_check);
+    RUN_TEST(test_registerReceiver_fails_after_five_attempts);
 
     RUN_TEST(test_registerSender_success);
     RUN_TEST(test_registerSender_relayError);
@@ -4207,6 +5035,8 @@ int main(void) {
     RUN_TEST(test_registerSender_corruptTooHigh);
     RUN_TEST(test_registerSender_dupTooHigh);
     RUN_TEST(test_registerSender_invalidSocket);
+    RUN_TEST(test_registerSender_ipv6_success);
+    RUN_TEST(test_registerSender_wrongRelayAddress);
 
     RUN_TEST(test_runSender_nullRelay_returnsFailure);
     RUN_TEST(test_runSender_nullFilename_returnsFailure);
@@ -4221,6 +5051,8 @@ int main(void) {
     RUN_TEST(test_runReceiver_emptyFile);
     RUN_TEST(test_runReceiver_discardsCorruptedPacket);
     RUN_TEST(test_runReceiver_outOfOrderData);  
+
+    RUN_TEST(test_completeTransfer_withLossCorruptionAndDuplication);
 
   return UNITY_END();
 }
